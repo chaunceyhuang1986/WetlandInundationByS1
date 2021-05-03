@@ -1,0 +1,525 @@
+//Level-1: maximum inundation mapping based on a time series of S1
+//Sentinel-1 GRD imagery is being used. Ground Range Detected imagery includes the following 
+//preprocessing steps: Thermal-Noise Removal, Radiometric calibration, Terrain-correction 
+//hence only a Speckle filter needs to be applied in the preprocessing.
+//author: Chang Huang
+//Date (last modified):2020-10-15
+//revised: use vv-vh, instead of vv/vh at log (dB) unit
+//revised: implement Hysteresis Thresholding Algorithm, fv: threshold_tfv_fix-2*std to threshold_tfv_fix-std
+//v2 revision:
+//revised: add vv rule to refine iow
+//revised: remove small fv(<9 pixels) on level-1
+//revised: remove fv far away (>3pixel) from iow
+//Author: Chang Huang (changh@nwu.edu.cn)
+
+
+var S1 = ee.ImageCollection('COPERNICUS/S1_GRD');
+// rename selected geometry feature 
+var aoi = ee.FeatureCollection('users/ChaunceyHuang/Yukon1');
+var scale = 10;
+var startyear = 2017;
+var endyear = 2019;
+var DBFilterR = 2;//radius for filtering original DB, in pixel
+var S1orbit = 'ASCENDING';//ASCENDING or DESCENDING
+var relative_orbit = 94;//relative orbit
+
+var threshold_tfv_fix = 12;//thresholds for identifying (temporally) flooded vegetation pixels, based on maxVV-meanVH
+var threshlod_dif_av = 3.0; //threshold difference between open water and aquatic vegetation 
+var threshold_fm_ndvi = 0.3; //threshold for identifying vegetation on open water (floating macrophyte)
+
+// Make a year sequence from 2015 to 2019 with a 1 year step.
+var yearList = ee.List.sequence(startyear, endyear, 1);
+//load S2 and calculate annual summer mosaic NDVI for identifying floating macrophyte
+// This function adds NDVI bands to S2 images.
+var addQualityBands = function(image) {
+  return image
+    .addBands(image.normalizedDifference(['B8', 'B4']).rename('NDVI'))// NDVI
+    .addBands(image.metadata('system:time_start'))// time in days
+    .set('year', ee.Image(image).date().get('year'));
+};
+var S2Collection = ee.ImageCollection('COPERNICUS/S2')
+ .filter(ee.Filter.calendarRange(6,9,'month'))
+ .filterBounds(aoi)
+ .map(addQualityBands);
+ // Import a S2 NDVI collection.
+var ndviCol = S2Collection.select('NDVI');
+// Map over the list of year to build a list of image composites.
+var ndviCompList = yearList.map(function(year) {
+  // Ensure that startYear is a number.
+  var Year = ee.Number(year);
+  // Filter images by year range
+  var newcol = ndviCol.filterMetadata('year', 'equals', Year);
+  var greenestPixelComposite = newcol.qualityMosaic('NDVI');
+  return greenestPixelComposite.set('year', Year);
+});
+// Convert the image List to an ImageCollection.
+var ndviCompCol = ee.ImageCollection.fromImages(ndviCompList);
+//print(ndviCompCol);
+
+// Load and filter Sentinel-1 GRD data by predefined parameters 
+var collection= S1
+    // Filter to get images with VV and VH dual polarization.
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  // Filter to get images collected in interferometric wide swath mode.
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  // Filter IWs to get High res.
+  .filter(ee.Filter.eq('resolution', 'H'))
+  // Filter IW-Highs to get 10m res
+  .filter(ee.Filter.eq('resolution_meters', 10))
+  //.filterDate(start, finish)
+  .filter(ee.Filter.calendarRange(startyear,endyear,'year'))
+  //filter non-frozon months
+  .filter(ee.Filter.calendarRange(5,10,'month'))
+  .filter(ee.Filter.eq('orbitProperties_pass', S1orbit))
+  .filter(ee.Filter.eq('relativeOrbitNumber_start',relative_orbit ))
+  .filterBounds(aoi);
+//print(collection);
+//mosaic same day tiles into one, and generate a new collection
+function mosaicByDate(imcol){
+  // imcol: An image collection
+  // returns: An image collection
+  var imlist = imcol.toList(imcol.size());
+  var unique_dates = imlist.map(function(im){
+    return ee.Image(im).date().format("YYYY-MM-dd");
+  }).distinct();
+  var mosaic_imlist = unique_dates.map(function(d){
+    d = ee.Date(d);
+    var im = imcol
+      .filterDate(d, d.advance(1, "day"))
+      .mosaic();
+    return im.set(
+        "system:time_start", d.millis(), 
+        "system:id", d.format("YYYY-MM-dd"));
+  });
+  return ee.ImageCollection(mosaic_imlist);
+}
+var newcoll = mosaicByDate(collection);
+//print(newcoll);
+//Function to convert from dB
+function toNatural(img) {
+  return ee.Image(10.0).pow(img.select(0).divide(10.0));
+}
+//Function to convert to dB
+function toDB(img) {
+  return ee.Image(img).log10().multiply(10.0);
+}
+//Apllying a Refined Lee Speckle filter as coded in the SNAP 3.0 S1TBX:
+//https://github.com/senbox-org/s1tbx/blob/master/s1tbx-op-sar-processing/src/main/java/org/esa/s1tbx/sar/gpf/filtering/SpeckleFilters/RefinedLee.java
+//Adapted by Guido Lemoine
+function RefinedLeeFunction(band){
+  // convert to natural.. do not apply function on dB!
+  var myimg = toNatural(band);
+   
+  var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+  var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+   
+  var mean3 = myimg.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+  var variance3 = myimg.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+   
+  // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+  var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+   
+  var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+   
+  // Calculate mean and variance for the sampled windows and store as 9 bands
+  var sample_mean = mean3.neighborhoodToBands(sample_kernel);
+  var sample_var = variance3.neighborhoodToBands(sample_kernel);
+   
+  // Determine the 4 gradients for the sampled windows
+  var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+  gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+  gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+  gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+   
+  // And find the maximum gradient amongst gradient bands
+  var max_gradient = gradients.reduce(ee.Reducer.max());
+   
+  // Create a mask for band pixels that are the maximum gradient
+  var gradmask = gradients.eq(max_gradient);
+   
+  // duplicate gradmask bands: each gradient represents 2 directions
+  gradmask = gradmask.addBands(gradmask);
+   
+  // Determine the 8 directions
+  var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+  directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+  directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+  directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+  // The next 4 are the not() of the previous 4
+  directions = directions.addBands(directions.select(0).not().multiply(5));
+  directions = directions.addBands(directions.select(1).not().multiply(6));
+  directions = directions.addBands(directions.select(2).not().multiply(7));
+  directions = directions.addBands(directions.select(3).not().multiply(8));
+   
+  // Mask all values that are not 1-8
+  directions = directions.updateMask(gradmask);
+   
+  // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+  directions = directions.reduce(ee.Reducer.sum());
+   
+  var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+   
+  // Calculate localNoiseVariance
+  var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+   
+  // Set up the 7*7 kernels for directional statistics
+  var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+   
+  var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0],
+  [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+   
+  var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+  var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+   
+  // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+  var dir_mean = myimg.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+  var dir_var = myimg.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+   
+  dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+  dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+   
+  // and add the bands for rotated kernels
+  for (var i=1; i<4; i++) {
+  dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+  dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+  dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  }
+   
+  // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+  dir_mean = dir_mean.reduce(ee.Reducer.sum());
+  dir_var = dir_var.reduce(ee.Reducer.sum());
+   
+  // A finally generate the filtered value
+  var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+   
+  var b = varX.divide(dir_var);
+   
+  var result = dir_mean.add(b.multiply(myimg.subtract(dir_mean)));
+  return(result);
+}
+function RefinedLee(img) {
+  // img must be in natural units, i.e. not in dB!
+  // Set up 3x3 kernels
+  var vv = img.select('VV');//select the VV polarization band
+  var vv_fil = RefinedLeeFunction(vv);
+  var vv_filband = ee.Image(toDB(vv_fil.arrayGet(0))).rename('VV_Filtered');
+  var vh = img.select('VH'); //select the VV polarization band
+  var vh_fil = RefinedLeeFunction(vh);
+  var vh_filband = ee.Image(toDB(vh_fil.arrayGet(0))).rename('VH_Filtered');
+  return(img.addBands(vv_filband).addBands(vh_filband));
+}
+// Filter speckle noise, looks too smoothed with 100m as radius
+var filterSpeckles = function(img) {
+  var vv = img.select('VV'); //select the VV polarization band
+  var vv_smoothed = vv.focal_median(DBFilterR,'circle').rename('VV_Filtered'); //Apply a focal median filter
+  var vh = img.select('VH'); //select the VV polarization band
+  var vh_smoothed = vh.focal_median(DBFilterR,'circle').rename('VH_Filtered'); //Apply a focal median filter
+  return img.addBands(vv_smoothed).addBands(vh_smoothed); // Add filtered VV & VH band to original image
+};
+
+// Map speckle noise filter across collection. Result is same collection, with smoothed VV band added to each image
+newcoll = newcoll.map(filterSpeckles);
+//newcoll = newcoll.map(RefinedLee);
+//var col = ee.ImageCollection(collection.select("filter"));
+print(newcoll);  
+
+//Map.centerObject(aoi);
+
+//calculate time series statistics of images
+var maxVV = newcoll.select('VV_Filtered').reduce(ee.Reducer.max()).select('VV_Filtered_max');
+var meanVV = newcoll.select('VV_Filtered').reduce(ee.Reducer.mean()).select('VV_Filtered_mean');
+var minVV = newcoll.select('VV_Filtered').reduce(ee.Reducer.min()).select('VV_Filtered_min');
+var stdVV = newcoll.select('VV_Filtered').reduce(ee.Reducer.stdDev()).select('VV_Filtered_stdDev');
+var maxVH = newcoll.select('VH_Filtered').reduce(ee.Reducer.max()).select('VH_Filtered_max');
+var meanVH = newcoll.select('VH_Filtered').reduce(ee.Reducer.mean()).select('VH_Filtered_mean');
+var minVH = newcoll.select('VH_Filtered').reduce(ee.Reducer.min()).select('VH_Filtered_min');
+var stdVH = newcoll.select('VH_Filtered').reduce(ee.Reducer.stdDev()).select('VH_Filtered_stdDev');
+
+var maxVVRmeanVH = maxVV.subtract(meanVH).rename('RmaxVV2VH');
+
+var histogrammeanVH = meanVH.reduceRegion({
+  reducer: ee.Reducer.histogram(255, 2),
+  geometry: aoi, 
+  scale: 10,
+  bestEffort: true
+});
+//print(histogrammeanVH);
+var histogrammeanVV = meanVV.reduceRegion({
+  reducer: ee.Reducer.histogram(255, 2),
+  geometry: aoi, 
+  scale: 10,
+  bestEffort: true
+});
+
+// Return the otsu threshold that maximizes interclass variance in a band (in the region).
+var otsu = function(histogram) {
+  var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+  var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+  var size = means.length().get([0]);
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean = sum.divide(total);
+  var indices = ee.List.sequence(1, size);
+  // Compute between sum of squares, where each mean partitions the data.
+  var bss = indices.map(function(i) {
+    var aCounts = counts.slice(0, 0, i);
+    var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans = means.slice(0, 0, i);
+    var aMean = aMeans.multiply(aCounts)
+        .reduce(ee.Reducer.sum(), [0]).get([0])
+        .divide(aCount);
+    var bCount = total.subtract(aCount);
+    var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+    return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+           bCount.multiply(bMean.subtract(mean).pow(2)));
+  });
+  // Return the mean value corresponding to the maximum BSS.
+  return means.sort(bss).get([-1]);
+};
+
+//indentify general open water (GOW) pixels
+var threshold_gow_vh = otsu(histogrammeanVH.get('VH_Filtered_mean'));
+print('meanVH threshold for gow', threshold_gow_vh);
+var threshold_gow_vv = otsu(histogrammeanVV.get('VV_Filtered_mean'));
+print('meanVV threshold for gow', threshold_gow_vv);
+var classGOW = meanVH.lt(threshold_gow_vh).and(meanVV.lt(threshold_gow_vv));
+
+//identify permanent open water pixels (POW)
+var refinedmaxVH = maxVH.updateMask(classGOW);
+var histogrammaxVH = refinedmaxVH.reduceRegion({
+  reducer: ee.Reducer.histogram(255, 2),
+  geometry: aoi, 
+  scale: 10,
+  bestEffort: true
+});
+var threshold_pow_vh = otsu(histogrammaxVH.get('VH_Filtered_max'));
+print('maxVH threshold for pow', threshold_pow_vh);
+var classPOW = maxVH.lt(threshold_pow_vh);
+
+//identify intermittent open water pixels (IOW)
+var owsamples = minVH.updateMask(classGOW);
+// Compute histogram
+var histogramiow = owsamples.reduceRegion({
+  reducer: ee.Reducer.histogram(255, 2)
+    .combine('mean', null, true)
+    .combine('variance', null, true), 
+  geometry: aoi, 
+  scale: 10,
+  bestEffort: true
+});
+//print(histogramiow);
+var iowmean = ee.Number(histogramiow.get('VH_Filtered_min_mean'));
+var iowvar = ee.Number(histogramiow.get('VH_Filtered_min_variance'));
+var iowstd = iowvar.sqrt();
+var threshold_iow_vh = iowmean.add(iowstd.multiply(2)); //3 sigmma
+print('minVH threshold for iow', threshold_iow_vh);
+//VV
+var owsamplesvv = minVV.updateMask(classGOW);
+// Compute histogram
+var histogramiowvv = owsamplesvv.reduceRegion({
+  reducer: ee.Reducer.histogram(255, 2)
+    .combine('mean', null, true)
+    .combine('variance', null, true), 
+  geometry: aoi, 
+  scale: 10,
+  bestEffort: true
+});
+var iowmeanvv = ee.Number(histogramiowvv.get('VV_Filtered_min_mean'));
+var iowvarvv = ee.Number(histogramiowvv.get('VV_Filtered_min_variance'));
+var iowstdvv = iowvarvv.sqrt();
+var threshold_iow_vv = iowmeanvv.add(iowstdvv.multiply(2)); //3 sigmma
+print('minVV threshold for iow', threshold_iow_vv);
+var classIOW = minVH.lt(threshold_iow_vh).and(minVV.lt(threshold_iow_vv));
+
+
+//map tfv
+// Create a binary layer usting logical operations.
+//var classTFV = maxVVRmeanVH.gt(threshold_tfv_fix);
+//identify tfv pixels based on maxVV - meanVH thresholding
+var classTFV = maxVVRmeanVH.gt(threshold_tfv_fix).and(classIOW.eq(0));
+/*
+//refine classtfv by eliminating small patches, too slow, do this offline
+classTFV = classTFV.selfMask().rename('initfv');
+var tfvId = classTFV.connectedComponents({
+  connectedness: ee.Kernel.square(1),//8-neighbors
+  maxSize: 128
+});
+var tfvSize = tfvId.select('labels')
+  .connectedPixelCount({
+    maxSize: 128, eightConnected: true
+  });
+var tfvareaMask = tfvSize.gte(25);
+classTFV = classTFV.updateMask(tfvareaMask);//eliminate small pathes (<25 pixels)
+
+//remove tfv patches far away (>5 pixels) from iow, too slow, do this offline
+// Create a source image where the geometry is 1, everything else is 0.
+var sources = classIOW.eq(1);
+// Mask the sources image with itself.
+sources = sources.updateMask(sources);
+var cost = ee.Image().toByte().paint(aoi, 1);
+// Compute the cumulative cost to traverse the land cover.
+var cumulativeCost = cost.cumulativeCost({
+  source: sources,
+  maxDistance: 1000 
+});
+Map.addLayer(cumulativeCost, {min: 0, max: 1000}, 'Distance');
+cumulativeCost = cumulativeCost.addBands(tfvId.select('labels'));
+// Calculate min cost (distance) per object defined by the previously added "labels" band.
+var patchDist = cumulativeCost.reduceConnectedComponents({
+  reducer: ee.Reducer.min(),
+  labelBand: 'labels'
+});
+var dismask = patchDist.lt(5);
+classTFV = classTFV.updateMask(dismask);//eliminate pathes that are not connected to highest confidence pixels
+*/
+
+//generate level-1 maximum inundation map by overlaying fv, pow, gow and iow
+var InundImgTmp = ee.Image().toByte().paint(minVH.geometry(), 0);
+var Level1InundMapraw = InundImgTmp.where(classTFV.eq(1), ee.Image(4)).where(classIOW.eq(1), ee.Image(3)).where(classGOW.eq(1), ee.Image(2)).where(classPOW.eq(1), ee.Image(1));
+
+var Level1InundMap = Level1InundMapraw.focal_mode();
+// Export the image, specifying scale and region.
+Export.image.toDrive({
+  image: Level1InundMap,
+  folder: 'S1InundationMapping',
+  description: 'Level1-InundationMap-Initial',
+  scale: 10,
+  fileFormat: 'GeoTIFF',
+  region: aoi,
+  maxPixels: 1e10
+});
+
+//level-2 inundation mapping
+//prepare a annual S2 maximum NDVI product, see codes at the beginning
+
+//add mean and std to a dictionary keyed by imageid
+// Extract the ID of each image object and set as property
+// within for each image in the collection
+var newcolls = newcoll.map(function(img) {
+    //identify open water pixels based on pow samples
+  var POWmask = Level1InundMap.eq(1);
+  // Compute histogram
+  var powsamples = img.select('VH_Filtered').updateMask(POWmask);
+  var histogram = powsamples.reduceRegion({
+    reducer: ee.Reducer.histogram(255, 2)
+      .combine('mean', null, true)
+      .combine('variance', null, true), 
+    geometry: aoi, 
+    scale: 10,
+    bestEffort: true
+  });
+  
+  var powmean = ee.Number(histogram.get('VH_Filtered_mean'));
+  var powvar = ee.Number(histogram.get('VH_Filtered_variance'));
+  var powstd = powvar.sqrt();
+    
+  var img_id = img.id();
+  return img.set('id',img_id).set('powmean',powmean).set('powstd',powstd);
+});//end of map function
+
+// Get the image IDs and names as lists from the collection
+var ids = ee.List(newcolls.aggregate_array('id'));
+var means = ee.List(newcolls.aggregate_array('powmean'));
+var stds = ee.List(newcolls.aggregate_array('powstd'));
+
+// Build dictionary from each image ID and mean and std
+var out_dict_mean = ee.Dictionary.fromLists(ids, means);
+var out_dict_std = ee.Dictionary.fromLists(ids, stds);
+print('Output mean Dictionary', out_dict_mean);
+print('Output std Dictionary', out_dict_std);
+
+//main function based vv and vh backscatter, under the basis of level-1 inundation map
+var inundationmapping = function(img) {
+  var vv = img.select('VV_Filtered'); //select the VV polarization band
+  var vh = img.select('VH_Filtered'); //select the VV polarization band
+  var vvRmeanVH = vv.subtract(meanVH).rename('RVV2VH');
+  //var owmask = img.select('waterMask');
+  
+  var img_id = img.id();
+  //retrieve pow mean and std based on imageid
+  var powmean = ee.Number(out_dict_mean.get(img_id));
+  var powstd = ee.Number(out_dict_std.get(img_id));
+  var sig = powstd.gt(3)? 2:3; //if std>3, 2 sigmma; otherwise 3 sigma
+  var threshold_ow_vh = powmean.add(powstd.multiply(sig)); 
+  
+  //var classow = vh.lt(threshold_ow_vh).eq(1).and(Level1InundMap.gt(0).and(Level1InundMap.lt(4)));
+  
+  //identify fm pixels in ow pixels based on NDVI
+  //var YYYY = ee.Number(ee.String(img_id).slice(0,4));
+  var YYYY = ee.Image(img).date().get('year');
+  var summerNDVI = ndviCompCol.filterMetadata('year', 'equals', YYYY).first().select('NDVI');
+  var vegmask = summerNDVI.gt(threshold_fm_ndvi);
+  
+  //identify av pixels based on VH thresholding, greater than ow by 3 db, 
+  //if ndvi>threshold, true av, otherwise, might be ow affected by wind effect
+  var threshold_av_vh = threshold_ow_vh.add(threshlod_dif_av);
+  var classav = vh.gt(threshold_ow_vh).and(vh.lt(threshold_av_vh)).and(Level1InundMap.gt(0).and(Level1InundMap.lt(4)));
+  classav = classav.updateMask(vegmask);
+  
+  var classow = vh.lt(threshold_av_vh).eq(1).and(Level1InundMap.gt(0).and(Level1InundMap.lt(4)));
+  //open water with higher confidence, vegetation on this, should be floating macrophyte
+  var classow_high = vh.lt(threshold_ow_vh).eq(1).and(Level1InundMap.gt(0).and(Level1InundMap.lt(4)));
+  var classfm = classow_high.eq(1).updateMask(vegmask);
+  
+  //identify fv pixels based on VV - meanVH thresholding
+  var threshold_fv = ee.Image(threshold_tfv_fix).subtract(stdVV.multiply(2));
+  var classfv = vvRmeanVH.gt(threshold_fv).and((Level1InundMap.eq(3).or(Level1InundMap.eq(4))));
+  //refine classfv by eliminating those objects that have maximum vvRmeanVH less than threshold_tfv_fix (equal to Hysteresis Thresholding Algorithm)
+  classfv = classfv.selfMask().rename('inifv');
+  var objectId = classfv.connectedComponents({
+    connectedness: ee.Kernel.square(1),//8-neighbors
+    maxSize: 128
+  });
+  var objectSize = objectId.select('labels')
+    .connectedPixelCount({
+      maxSize: 128, eightConnected: true
+    });
+  var areaMask = objectSize.gte(9);
+  objectId = objectId.updateMask(areaMask);//eliminate small pathes (<9 pixels)
+  
+  vvRmeanVH = vvRmeanVH.addBands(objectId.select('labels'));
+  // Calculate max vvRmeanVH per object defined by the previously added "labels" band.
+  var patchTemp = vvRmeanVH.reduceConnectedComponents({
+    reducer: ee.Reducer.max(),
+    labelBand: 'labels'
+  });
+  var valmask = patchTemp.lt(ee.Image(threshold_tfv_fix).subtract(stdVV));
+  classfv = classfv.updateMask(valmask.not());//eliminate pathes that are not connected to highest confidence pixels
+    
+  //generate level-2 inundation map by overlaying fv, av, fm and ow, order is important
+  var L2InundImgTmp = ee.Image().toByte().paint(img.geometry(), 0);
+  var Level2InundMap = L2InundImgTmp.where(classfv.eq(1), ee.Image(4)).where(classow.eq(1), ee.Image(1)).where(classav.eq(1), ee.Image(3)).where(classfm.eq(1), ee.Image(2));
+  Level2InundMap = Level2InundMap.rename('Inundationmap');
+  return img.addBands(Level2InundMap); // Add inundation map band to original image
+};
+
+//User memory limit exceeded when output all results
+//output each year once
+// Map speckle noise filter across collection. Result is same collection, with smoothed VV band added to each image
+var InundMapcollection = newcolls.map(inundationmapping);
+print(InundMapcollection);
+var maps = InundMapcollection.select('Inundationmap').toBands();
+
+// Export the image, specifying scale and region.
+Export.image.toDrive({
+  image: maps,
+  folder: 'S1InundationMapping',
+  description: 'Level2-InundationSeries-initial',
+  scale: 10,
+  region: aoi,
+  maxPixels: 1e9
+});
+/*
+//Export annual NDVI, checked, no problem
+var NDVIs = ndviCompCol.select('NDVI').toBands();
+Export.image.toDrive({
+  image: NDVIs,
+  folder: 'S1InundationMapping',
+  description: 'S2-annual-NDVI',
+  scale: 10,
+  region: aoi
+});
+*/
+
