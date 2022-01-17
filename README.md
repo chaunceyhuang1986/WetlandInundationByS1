@@ -9,4 +9,4 @@ Python code in /Sentinel1Offline/ provides post-processing functions to deal wit
 
 The corresponding paper is currently under review by ISPRS Journal of photogrammetry and remote sensing. Please cite as below if you are using these codes.
 
-Huang C, Smith L C, Kyzivat E D, et al. 2021. Tracking transient Arctic-Boreal wetland inundation from Sentinel-1 SAR. ISPRS Journal of photogrammetry and remote sensing, (Under review).
+Huang C, Smith L C, Kyzivat E D, et al. 2021. Tracking transient Arctic-Boreal wetland inundation from Sentinel-1 SAR. Remote Sensing of Environment, (Under review).
