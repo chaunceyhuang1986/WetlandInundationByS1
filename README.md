@@ -7,6 +7,6 @@ GEE code can be found in InundationMappingWithGEE.txt, which generates initial i
 
 Python code in /Sentinel1Offline/ provides post-processing functions to deal with the intial inundation maps dervied by GEE. Codes for mapping spatio-temporal inundation dynamics, and accuracy assessment are also included.
 
-The corresponding paper is currently under review by ISPRS Journal of photogrammetry and remote sensing. Please cite as below if you are using these codes.
+The corresponding paper is currently under review by Remote Sensing of Environment. Please cite as below if you are using these codes.
 
 Huang C, Smith L C, Kyzivat E D, et al. 2021. Tracking transient Arctic-Boreal wetland inundation from Sentinel-1 SAR. Remote Sensing of Environment, (Under review).
